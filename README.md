@@ -1,6 +1,6 @@
 # SwitchOps — HBK Salesforce Ops Toolkit
 
-A client-side single-page application providing 12 operational tools for managing HBK's Salesforce org. All data stays in the browser — no backend servers, no external services, no telemetry.
+A single-page application providing 12 operational tools for managing HBK's Salesforce org. All Salesforce data stays between your browser and your org — routed through a lightweight auth proxy to eliminate CORS issues. No external analytics, no telemetry.
 
 ## Features
 
@@ -26,12 +26,23 @@ A client-side single-page application providing 12 operational tools for managin
 11. **FSL Data Loader** — Excel/CSV upload wizard for Field Service Lightning data (WorkType, ServiceTerritory, etc.)
 12. **CPQ Product Loader** — Excel/CSV upload wizard for CPQ product structures (Product2, Features, Options, Rules)
 
+## Architecture
+
+```
+Browser (SPA)  ──>  Auth Proxy (Node.js)  ──>  Salesforce APIs
+                    - Token exchange           - REST API
+                    - API forwarding           - Tooling API
+                    - CORS headers             - Composite API
+```
+
+The auth proxy eliminates CORS issues by forwarding all Salesforce API calls server-to-server. The proxy never stores tokens or data — it only relays requests.
+
 ## Security
 
-- **Zero external data transmission** — all data stays in the browser or goes directly to your Salesforce org
+- **Data flows only to your Salesforce org** — via the auth proxy (no data stored on proxy)
 - **Token in memory only** — closing the tab wipes the session
 - **No analytics, tracking, or telemetry**
-- **No backend server** — pure static SPA
+- **Client secret stays server-side** — never exposed to the browser
 - **All libraries bundled** — works air-gapped after initial load
 
 ## Tech Stack
@@ -56,9 +67,24 @@ A client-side single-page application providing 12 operational tools for managin
 ```bash
 git clone https://github.com/<your-username>/switchOps.git
 cd switchOps
-cp .env.example .env
-# Edit .env with your Connected App Consumer Key and callback URL
+
+# 1. Install frontend dependencies
 npm install
+
+# 2. Install proxy dependencies
+cd server && npm install && cd ..
+
+# 3. Configure environment
+cp .env.example .env
+# Edit .env:
+#   VITE_SF_CLIENT_ID=<your Connected App Consumer Key>
+#   VITE_SF_REDIRECT_URI=http://localhost:5173/callback
+#   VITE_SF_AUTH_PROXY_URL=http://localhost:10000
+
+# 4. Start the auth proxy (in a separate terminal)
+cd server && FRONTEND_ORIGIN=http://localhost:5173 node auth-proxy.js
+
+# 5. Start the frontend
 npm run dev
 # Opens at http://localhost:5173
 ```
@@ -84,40 +110,60 @@ npm run build
      - `https://switchops.onrender.com/callback` (production)
    - **Selected OAuth Scopes**: `Access the identity URL service (id, profile, email, address, phone)`, `Manage user data via APIs (api)`, `Perform requests at any time (refresh_token, offline_access)`
    - **Require Proof Key for Code Exchange (PKCE)**: Check this
-   - **Require Secret for Web Server Flow**: **Uncheck** this
-4. Save. Copy the **Consumer Key** — this is your `VITE_SF_CLIENT_ID`
-5. Go to **Setup > Security > CORS**:
-   - Add Allowed Origin: `http://localhost:5173`
-   - Add Allowed Origin: `https://switchops.onrender.com`
+   - **Require Secret for Web Server Flow**: Uncheck (or leave checked if you set `SF_OAUTH_CLIENT_SECRET` on the proxy)
+4. Save. Copy the **Consumer Key** (this is `VITE_SF_CLIENT_ID`) and optionally the **Consumer Secret** (this is `SF_OAUTH_CLIENT_SECRET` for the proxy)
+5. **No CORS setup needed** — the auth proxy handles all API calls server-to-server
 
-## Hosting on Render (Static Site)
+## Hosting on Render
 
-### Steps
+The app deploys as **two Render services** (defined in `render.yaml`):
 
-1. **Create a Render account** at https://render.com (free tier works)
+### Option A: Deploy via render.yaml (recommended)
 
-2. **Connect GitHub**: Dashboard > New > Static Site > Connect your GitHub account > Select `switchOps`
+1. Go to Render Dashboard > **New** > **Blueprint**
+2. Connect your GitHub repo and select `switchOps`
+3. Render reads `render.yaml` and creates both services automatically
+4. Set the environment variables for each service (see below)
 
-3. **Configure**:
+### Option B: Deploy manually
+
+#### Service 1: Auth Proxy (Web Service)
+
+1. Render Dashboard > **New** > **Web Service**
+2. Connect `switchOps` repo
+3. Configure:
+   - **Name**: `switchops-auth-proxy`
+   - **Runtime**: Node
+   - **Build Command**: `cd server && npm ci`
+   - **Start Command**: `cd server && npm start`
+4. **Environment Variables**:
+   - `FRONTEND_ORIGIN` = `https://switchops.onrender.com`
+   - `SF_OAUTH_CLIENT_SECRET` = your Connected App Consumer Secret (optional but recommended)
+   - `SF_OAUTH_ALLOWED_HOSTS` = `login.salesforce.com,test.salesforce.com`
+   - `SF_API_ALLOWED_HOST_SUFFIXES` = `salesforce.com,force.com,salesforce.mil`
+
+#### Service 2: Frontend (Static Site)
+
+1. Render Dashboard > **New** > **Static Site**
+2. Connect `switchOps` repo
+3. Configure:
    - **Name**: `switchops`
-   - **Branch**: `main`
-   - **Build Command**: `npm install && npm run build`
+   - **Build Command**: `npm ci && npm run build`
    - **Publish Directory**: `dist`
-
-4. **Environment Variables** (under Environment tab):
+4. **Environment Variables**:
    - `VITE_SF_CLIENT_ID` = your Connected App Consumer Key
-   - `VITE_SF_CALLBACK_URL` = `https://switchops.onrender.com/callback`
+   - `VITE_SF_REDIRECT_URI` = `https://switchops.onrender.com/callback`
+   - `VITE_SF_AUTH_PROXY_URL` = `https://switchops-auth-proxy.onrender.com`
+5. Under **Redirects/Rewrites**, add: `/* -> /index.html` (rewrite) for SPA routing
 
-5. **Deploy**: Render will build and deploy automatically
+### After Deployment
 
-6. **Update Salesforce**:
-   - Add `https://switchops.onrender.com/callback` to your Connected App's Callback URLs
-   - Add `https://switchops.onrender.com` to CORS Allowed Origins in Salesforce Setup
-
-7. **Verify**: Visit `https://switchops.onrender.com` — you should see the login screen
+1. Add `https://switchops.onrender.com/callback` to your Connected App's Callback URLs in Salesforce
+2. Visit `https://switchops.onrender.com` — you should see the login screen
+3. **No CORS setup needed in Salesforce** — the proxy handles all API calls server-to-server
 
 ### Auto-Deploy
-Render auto-deploys on every push to `main`. To disable: Render Dashboard > switchops > Settings > Auto-Deploy > toggle off.
+Render auto-deploys on every push to `main`. To disable: Render Dashboard > Settings > Auto-Deploy > toggle off.
 
 ### Custom Domain
 1. Render Dashboard > switchops > Settings > Custom Domains > Add domain
@@ -130,8 +176,8 @@ Render auto-deploys on every push to `main`. To disable: Render Dashboard > swit
 |-------|-----|
 | Build failed | Run `npm run build` locally first to debug |
 | OAuth redirect fails | Verify Callback URL matches exactly (including `/callback` path) |
-| CORS errors | Add your domain to Salesforce Setup > Security > CORS |
-| Blank page after deploy | Verify Publish Directory is `dist` |
+| API calls fail | Check proxy logs on Render; verify `VITE_SF_AUTH_PROXY_URL` points to the proxy |
+| Blank page after deploy | Verify Publish Directory is `dist` and SPA rewrite rule is set |
 | Token expired | Click Disconnect and reconnect — tokens are memory-only |
 
 ## Keyboard Shortcuts

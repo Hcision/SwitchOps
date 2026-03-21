@@ -1,0 +1,10 @@
+{
+  "name": "switchops-auth-proxy",
+  "private": true,
+  "scripts": {
+    "start": "node auth-proxy.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0"
+  }
+}

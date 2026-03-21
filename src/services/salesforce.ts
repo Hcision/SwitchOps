@@ -11,7 +11,8 @@ import type { AuthState } from '@/services/store';
 const API_VERSION = 'v62.0';
 
 const SF_CLIENT_ID = import.meta.env.VITE_SF_CLIENT_ID as string;
-const SF_CALLBACK_URL = import.meta.env.VITE_SF_CALLBACK_URL as string;
+const SF_CALLBACK_URL = import.meta.env.VITE_SF_REDIRECT_URI as string;
+const SF_AUTH_PROXY_URL = (import.meta.env.VITE_SF_AUTH_PROXY_URL as string || '').replace(/\/+$/, '');
 
 // ---------------------------------------------------------------------------
 // Types
@@ -159,6 +160,7 @@ export class SalesforceError extends Error {
 let _accessToken: string | null = null;
 let _instanceUrl: string | null = null;
 let _codeVerifier: string | null = null;
+let _loginBase: string | null = null;
 
 // ---------------------------------------------------------------------------
 // PKCE Helpers
@@ -219,6 +221,8 @@ export async function initiateLogin(isSandbox: boolean): Promise<void> {
     ? 'https://test.salesforce.com'
     : 'https://login.salesforce.com';
 
+  _loginBase = baseUrl;
+
   const params = new URLSearchParams({
     response_type: 'code',
     client_id: SF_CLIENT_ID,
@@ -261,22 +265,20 @@ export async function handleCallback(): Promise<SalesforceTokenResponse> {
     );
   }
 
-  // Determine token endpoint: prefer the instance from the issuer hint
-  // embedded in the state, but fall back to login.salesforce.com.
-  const tokenUrl = 'https://login.salesforce.com/services/oauth2/token';
+  // Exchange authorization code via the auth proxy (server-to-server,
+  // avoids CORS). The proxy forwards to Salesforce's token endpoint.
+  const loginBase = _loginBase || 'https://login.salesforce.com';
 
-  const body = new URLSearchParams({
-    grant_type: 'authorization_code',
-    client_id: SF_CLIENT_ID,
-    redirect_uri: SF_CALLBACK_URL,
-    code,
-    code_verifier: _codeVerifier,
-  });
-
-  const response = await fetch(tokenUrl, {
+  const response = await fetch(`${SF_AUTH_PROXY_URL}/oauth/token`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: body.toString(),
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      loginBase,
+      clientId: SF_CLIENT_ID,
+      code,
+      redirectUri: SF_CALLBACK_URL,
+      codeVerifier: _codeVerifier,
+    }),
   });
 
   if (!response.ok) {
@@ -339,10 +341,21 @@ interface SalesforceUserInfo {
 export async function login(): Promise<AuthState> {
   const tokenData = await handleCallback();
 
-  // Fetch user info from the identity URL returned in the token response
-  const userInfo = await fetchJson<SalesforceUserInfo>(tokenData.id, {
-    headers: { Authorization: `Bearer ${tokenData.access_token}` },
-  });
+  // Fetch user info via the proxy (the identity URL is on Salesforce's domain,
+  // so it also needs to go through the proxy to avoid CORS).
+  // Extract the path from the identity URL: https://login.salesforce.com/id/00D.../005...
+  const idUrl = new URL(tokenData.id);
+  const identityPath = idUrl.pathname; // e.g. /id/00D.../005...
+
+  const userInfo = await fetchJson<SalesforceUserInfo>(
+    `${SF_AUTH_PROXY_URL}/salesforce${identityPath}`,
+    {
+      headers: {
+        'x-sf-instance-url': tokenData.instance_url,
+        'x-sf-access-token': tokenData.access_token,
+      },
+    },
+  );
 
   // Determine sandbox vs production from the instance URL
   const isSandbox =
@@ -405,6 +418,7 @@ export function logout(): void {
   _accessToken = null;
   _instanceUrl = null;
   _codeVerifier = null;
+  _loginBase = null;
 }
 
 /**
@@ -443,10 +457,13 @@ export async function sfRequest<T = unknown>(
     );
   }
 
-  const url = `${_instanceUrl}${path}`;
+  // Route all Salesforce API calls through the auth proxy to avoid CORS.
+  // The proxy forwards requests server-to-server to the Salesforce instance.
+  const url = `${SF_AUTH_PROXY_URL}/salesforce${path}`;
 
   const headers = new Headers(options.headers);
-  headers.set('Authorization', `Bearer ${_accessToken}`);
+  headers.set('x-sf-instance-url', _instanceUrl);
+  headers.set('x-sf-access-token', _accessToken);
   if (!headers.has('Content-Type') && options.body) {
     headers.set('Content-Type', 'application/json');
   }
