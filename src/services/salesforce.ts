@@ -159,8 +159,34 @@ export class SalesforceError extends Error {
 
 let _accessToken: string | null = null;
 let _instanceUrl: string | null = null;
-let _codeVerifier: string | null = null;
-let _loginBase: string | null = null;
+
+// ---------------------------------------------------------------------------
+// OAuth transaction storage (sessionStorage)
+// The PKCE verifier and login base must survive the redirect to Salesforce
+// and back. sessionStorage is scoped to the tab and cleared on close.
+// ---------------------------------------------------------------------------
+
+const OAUTH_TXN_KEY = 'switchops.oauth-txn';
+
+interface OAuthTransaction {
+  codeVerifier: string;
+  loginBase: string;
+}
+
+function setOAuthTransaction(txn: OAuthTransaction): void {
+  try { sessionStorage.setItem(OAUTH_TXN_KEY, JSON.stringify(txn)); } catch { /* noop */ }
+}
+
+function getOAuthTransaction(): OAuthTransaction | null {
+  try {
+    const raw = sessionStorage.getItem(OAUTH_TXN_KEY);
+    return raw ? JSON.parse(raw) as OAuthTransaction : null;
+  } catch { return null; }
+}
+
+function clearOAuthTransaction(): void {
+  try { sessionStorage.removeItem(OAUTH_TXN_KEY); } catch { /* noop */ }
+}
 
 // ---------------------------------------------------------------------------
 // PKCE Helpers
@@ -213,7 +239,6 @@ function base64UrlEncode(bytes: Uint8Array): string {
  */
 export async function initiateLogin(isSandbox: boolean): Promise<void> {
   const verifier = generateCodeVerifier();
-  _codeVerifier = verifier;
 
   const challenge = await generateCodeChallenge(verifier);
 
@@ -221,7 +246,9 @@ export async function initiateLogin(isSandbox: boolean): Promise<void> {
     ? 'https://test.salesforce.com'
     : 'https://login.salesforce.com';
 
-  _loginBase = baseUrl;
+  // Persist the PKCE verifier and login base in sessionStorage so they
+  // survive the redirect to Salesforce and back.
+  setOAuthTransaction({ codeVerifier: verifier, loginBase: baseUrl });
 
   const params = new URLSearchParams({
     response_type: 'code',
@@ -257,7 +284,8 @@ export async function handleCallback(): Promise<SalesforceTokenResponse> {
     );
   }
 
-  if (!_codeVerifier) {
+  const txn = getOAuthTransaction();
+  if (!txn?.codeVerifier) {
     throw new SalesforceError(
       'No PKCE code verifier found. Did the login flow start in this session?',
       400,
@@ -267,17 +295,15 @@ export async function handleCallback(): Promise<SalesforceTokenResponse> {
 
   // Exchange authorization code via the auth proxy (server-to-server,
   // avoids CORS). The proxy forwards to Salesforce's token endpoint.
-  const loginBase = _loginBase || 'https://login.salesforce.com';
-
   const response = await fetch(`${SF_AUTH_PROXY_URL}/oauth/token`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      loginBase,
+      loginBase: txn.loginBase,
       clientId: SF_CLIENT_ID,
       code,
       redirectUri: SF_CALLBACK_URL,
-      codeVerifier: _codeVerifier,
+      codeVerifier: txn.codeVerifier,
     }),
   });
 
@@ -300,7 +326,7 @@ export async function handleCallback(): Promise<SalesforceTokenResponse> {
 
   _accessToken = rawToken.access_token;
   _instanceUrl = rawToken.instance_url;
-  _codeVerifier = null; // no longer needed
+  clearOAuthTransaction(); // no longer needed
 
   // Parse the user Id from the identity URL (last segment).
   // The `id` field looks like: https://login.salesforce.com/id/00Dxx.../005xx...
@@ -417,8 +443,7 @@ export function isAuthenticated(): boolean {
 export function logout(): void {
   _accessToken = null;
   _instanceUrl = null;
-  _codeVerifier = null;
-  _loginBase = null;
+  clearOAuthTransaction();
 }
 
 /**
