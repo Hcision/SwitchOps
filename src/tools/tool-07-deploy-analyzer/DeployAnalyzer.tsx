@@ -55,8 +55,10 @@ interface ParsedComponent {
 }
 
 interface DependencyRecord {
+  MetadataComponentId: string;
   MetadataComponentName: string;
   MetadataComponentType: string;
+  RefMetadataComponentId: string;
   RefMetadataComponentName: string;
   RefMetadataComponentType: string;
 }
@@ -476,19 +478,28 @@ export default function DeployAnalyzer() {
       const names = parsedComponents.map((c) => c.name);
       const namesList = names.map((n) => `'${n}'`).join(',');
 
-      // Query: what does each changed component DEPEND ON (references)
-      const refsQuery = `SELECT MetadataComponentName, MetadataComponentType, RefMetadataComponentName, RefMetadataComponentType FROM MetadataComponentDependency WHERE MetadataComponentName IN (${namesList})`;
+      let refsRecords: DependencyRecord[] = [];
+      let depsRecords: DependencyRecord[] = [];
+      let dependencyWarning: string | null = null;
 
-      // Query: what depends ON each changed component (dependents)
-      const depsQuery = `SELECT MetadataComponentName, MetadataComponentType, RefMetadataComponentName, RefMetadataComponentType FROM MetadataComponentDependency WHERE RefMetadataComponentName IN (${namesList})`;
+      try {
+        // Query: what does each changed component DEPEND ON (references)
+        const refsQuery = `SELECT MetadataComponentId, MetadataComponentName, MetadataComponentType, RefMetadataComponentId, RefMetadataComponentName, RefMetadataComponentType FROM MetadataComponentDependency WHERE MetadataComponentName IN (${namesList})`;
 
-      const [refsResult, depsResult] = await Promise.all([
-        toolingQuery<DependencyRecord & { Id?: string; attributes?: { type: string; url: string } }>(refsQuery),
-        toolingQuery<DependencyRecord & { Id?: string; attributes?: { type: string; url: string } }>(depsQuery),
-      ]);
+        // Query: what depends ON each changed component (dependents)
+        const depsQuery = `SELECT MetadataComponentId, MetadataComponentName, MetadataComponentType, RefMetadataComponentId, RefMetadataComponentName, RefMetadataComponentType FROM MetadataComponentDependency WHERE RefMetadataComponentName IN (${namesList})`;
 
-      const refsRecords = refsResult.records as DependencyRecord[];
-      const depsRecords = depsResult.records as DependencyRecord[];
+        const [refsResult, depsResult] = await Promise.all([
+          toolingQuery<DependencyRecord & { Id?: string; attributes?: { type: string; url: string } }>(refsQuery),
+          toolingQuery<DependencyRecord & { Id?: string; attributes?: { type: string; url: string } }>(depsQuery),
+        ]);
+
+        refsRecords = refsResult.records as DependencyRecord[];
+        depsRecords = depsResult.records as DependencyRecord[];
+      } catch {
+        dependencyWarning =
+          'MetadataComponentDependency not available in this org edition. Dependency analysis requires Enterprise Edition or higher.';
+      }
 
       const results: ComponentAnalysis[] = parsedComponents.map((component) => {
         const references = refsRecords.filter(
@@ -517,6 +528,10 @@ export default function DeployAnalyzer() {
       setAnalyses(results);
       setChecklist(generatedChecklist);
       setActiveTab('dependencies');
+
+      if (dependencyWarning) {
+        setError(dependencyWarning);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An unexpected error occurred.');
     } finally {

@@ -25,7 +25,7 @@ import StatusBadge from '@/components/StatusBadge';
 import LoadingSpinner from '@/components/LoadingSpinner';
 import ErrorAlert from '@/components/ErrorAlert';
 import { useAppStore } from '@/services/store';
-import { queryAll, toolingQuery, query, getRecord } from '@/services/salesforce';
+import { toolingQuery, query, getRecord } from '@/services/salesforce';
 import type { ColumnDef } from '@tanstack/react-table';
 
 // ---------------------------------------------------------------------------
@@ -355,12 +355,12 @@ export default function FieldLineage() {
 
     setLoadingObjects(true);
     try {
-      const result = await queryAll(
-        "SELECT QualifiedApiName, Label FROM EntityDefinition WHERE IsCustomizable = true ORDER BY Label",
+      const result = await toolingQuery<{ QualifiedApiName: string; Label: string }>(
+        "SELECT QualifiedApiName, Label FROM EntityDefinition WHERE IsCustomizable = true ORDER BY QualifiedApiName LIMIT 200",
       );
       const mapped: ObjectOption[] = result.records.map((r) => ({
-        apiName: r.QualifiedApiName as string,
-        label: r.Label as string,
+        apiName: r.QualifiedApiName,
+        label: r.Label,
       }));
       setObjects(mapped);
       setCacheEntry(`${CACHE_KEY}-objects`, mapped);
@@ -388,12 +388,12 @@ export default function FieldLineage() {
 
       setLoadingFields(true);
       try {
-        const result = await queryAll(
-          `SELECT QualifiedApiName, Label FROM FieldDefinition WHERE EntityDefinition.QualifiedApiName = '${objectApiName}'`,
+        const result = await toolingQuery<{ QualifiedApiName: string; Label: string }>(
+          `SELECT QualifiedApiName, Label FROM FieldDefinition WHERE EntityDefinition.QualifiedApiName = '${objectApiName}' ORDER BY QualifiedApiName LIMIT 500`,
         );
         const mapped: FieldOption[] = result.records.map((r) => ({
-          apiName: r.QualifiedApiName as string,
-          label: r.Label as string,
+          apiName: r.QualifiedApiName,
+          label: r.Label,
         }));
         setFields(mapped);
         setCacheEntry(cacheKey, mapped);
@@ -421,42 +421,36 @@ export default function FieldLineage() {
         if (direction === 'forward') {
           // Find automations that reference this field (where this field is consumed)
           const result = await toolingQuery<DependencyRecord>(
-            `SELECT MetadataComponentId, MetadataComponentName, MetadataComponentType, RefMetadataComponentId, RefMetadataComponentName, RefMetadataComponentType FROM MetadataComponentDependency WHERE RefMetadataComponentName = '${fullFieldRef}' AND RefMetadataComponentType = 'CustomField'`,
+            `SELECT MetadataComponentId, MetadataComponentName, MetadataComponentType, RefMetadataComponentId, RefMetadataComponentName, RefMetadataComponentType FROM MetadataComponentDependency WHERE RefMetadataComponentName = '${fullFieldRef}'`,
           );
           return result.records;
         } else {
           // Find automations that write to this field (where this field is produced)
           const result = await toolingQuery<DependencyRecord>(
-            `SELECT MetadataComponentId, MetadataComponentName, MetadataComponentType, RefMetadataComponentId, RefMetadataComponentName, RefMetadataComponentType FROM MetadataComponentDependency WHERE MetadataComponentName = '${fullFieldRef}' AND MetadataComponentType = 'CustomField'`,
+            `SELECT MetadataComponentId, MetadataComponentName, MetadataComponentType, RefMetadataComponentId, RefMetadataComponentName, RefMetadataComponentType FROM MetadataComponentDependency WHERE MetadataComponentName = '${fullFieldRef}'`,
           );
           return result.records;
         }
       } catch {
-        // Fallback: query without strict type filter
+        // Fallback: query without strict field reference
         try {
           if (direction === 'forward') {
             const result = await toolingQuery<DependencyRecord>(
-              `SELECT MetadataComponentId, MetadataComponentName, MetadataComponentType, RefMetadataComponentId, RefMetadataComponentName, RefMetadataComponentType FROM MetadataComponentDependency WHERE RefMetadataComponentName LIKE '%${fieldName}%'`,
+              `SELECT MetadataComponentId, MetadataComponentName, MetadataComponentType, RefMetadataComponentId, RefMetadataComponentName, RefMetadataComponentType FROM MetadataComponentDependency WHERE RefMetadataComponentName = '${fieldName}'`,
             );
-            return result.records.filter(
-              (r) =>
-                (r.RefMetadataComponentName as string)?.includes(objectName) ||
-                (r.RefMetadataComponentName as string)?.includes(fieldName),
-            );
+            return result.records;
           } else {
             const result = await toolingQuery<DependencyRecord>(
-              `SELECT MetadataComponentId, MetadataComponentName, MetadataComponentType, RefMetadataComponentId, RefMetadataComponentName, RefMetadataComponentType FROM MetadataComponentDependency WHERE MetadataComponentName LIKE '%${fieldName}%'`,
+              `SELECT MetadataComponentId, MetadataComponentName, MetadataComponentType, RefMetadataComponentId, RefMetadataComponentName, RefMetadataComponentType FROM MetadataComponentDependency WHERE MetadataComponentName = '${fieldName}'`,
             );
-            return result.records.filter(
-              (r) =>
-                (r.MetadataComponentName as string)?.includes(objectName) ||
-                (r.MetadataComponentName as string)?.includes(fieldName),
-            );
+            return result.records;
           }
-        } catch (err2) {
-          throw new Error(
-            `Failed to query dependencies: ${err2 instanceof Error ? err2.message : String(err2)}`,
+        } catch {
+          // MetadataComponentDependency not available in this org edition
+          setError(
+            'MetadataComponentDependency not available in this org edition. Dependency analysis requires Enterprise Edition or higher.',
           );
+          return [];
         }
       }
     },

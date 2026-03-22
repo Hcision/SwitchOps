@@ -4,7 +4,7 @@ import DataTable from '@/components/DataTable';
 import StatusBadge from '@/components/StatusBadge';
 import LoadingSpinner from '@/components/LoadingSpinner';
 import ErrorAlert from '@/components/ErrorAlert';
-import { toolingQuery } from '@/services/salesforce';
+import { toolingQuery, sfRequest } from '@/services/salesforce';
 import type { ColumnDef } from '@tanstack/react-table';
 
 // ---------------------------------------------------------------------------
@@ -25,8 +25,18 @@ interface ValidationRuleRecord {
   EntityDefinition: {
     QualifiedApiName: string;
   };
+  ValidationName: string;
+  Active: boolean;
+  Description: string | null;
+  ErrorDisplayField: string | null;
+  ErrorMessage: string;
   FullName: string;
+}
+
+interface ValidationRuleDetailResponse {
+  Id: string;
   Metadata: ValidationRuleMetadata;
+  [key: string]: unknown;
 }
 
 interface ParsedValidationRule {
@@ -570,28 +580,27 @@ export default function ValidationExplorer() {
 
     try {
       const soql =
-        'SELECT Id, EntityDefinition.QualifiedApiName, FullName, Metadata FROM ValidationRule';
+        'SELECT Id, EntityDefinition.QualifiedApiName, ValidationName, Active, Description, ErrorDisplayField, ErrorMessage, FullName FROM ValidationRule';
       const result = await toolingQuery<ValidationRuleRecord>(soql);
 
+      // Build initial parsed rules without formulas (which require separate REST calls)
       const parsed: ParsedValidationRule[] = result.records.map((rec) => {
         const objectName = rec.EntityDefinition?.QualifiedApiName ?? 'Unknown';
         const fullName = rec.FullName ?? '';
-        // FullName is usually "ObjectName.RuleName"
         const dotIndex = fullName.indexOf('.');
-        const ruleName = dotIndex >= 0 ? fullName.substring(dotIndex + 1) : fullName;
-        const meta = rec.Metadata;
+        const ruleName = dotIndex >= 0 ? fullName.substring(dotIndex + 1) : (rec.ValidationName ?? fullName);
 
         return {
           id: rec.Id ?? fullName,
           objectName,
           fullName,
           ruleName,
-          active: meta?.active ?? false,
-          description: meta?.description ?? null,
-          formula: meta?.errorConditionFormula ?? '',
-          errorMessage: meta?.errorMessage ?? '',
-          errorDisplayField: meta?.errorDisplayField ?? null,
-          englishDescription: parseFormulaToEnglish(meta?.errorConditionFormula ?? ''),
+          active: rec.Active ?? false,
+          description: rec.Description ?? null,
+          formula: 'Loading formula...',
+          errorMessage: rec.ErrorMessage ?? '',
+          errorDisplayField: rec.ErrorDisplayField ?? null,
+          englishDescription: 'Loading...',
           lastModified: '',
         };
       });
@@ -614,6 +623,37 @@ export default function ValidationExplorer() {
         });
         setSelectedObject(maxObj);
         if (!simulatorObject) setSimulatorObject(maxObj);
+      }
+
+      // Fetch full metadata (including errorConditionFormula) in batches of 10
+      const BATCH_SIZE = 10;
+      for (let i = 0; i < parsed.length; i += BATCH_SIZE) {
+        const batch = parsed.slice(i, i + BATCH_SIZE);
+        const details = await Promise.all(
+          batch.map((rule) =>
+            sfRequest<ValidationRuleDetailResponse>(
+              `/services/data/v62.0/tooling/sobjects/ValidationRule/${rule.id}`,
+            ).catch(() => null),
+          ),
+        );
+
+        setRules((prev) =>
+          prev.map((rule) => {
+            const detail = details.find(
+              (d) => d !== null && d.Id === rule.id,
+            );
+            if (detail?.Metadata) {
+              const formula = detail.Metadata.errorConditionFormula ?? '';
+              return {
+                ...rule,
+                formula,
+                description: detail.Metadata.description ?? rule.description,
+                englishDescription: parseFormulaToEnglish(formula),
+              };
+            }
+            return rule;
+          }),
+        );
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to fetch validation rules';

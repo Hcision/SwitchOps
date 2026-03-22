@@ -9,6 +9,7 @@ import {
   AlertTriangle,
   ChevronDown,
   ChevronUp,
+  Info,
 } from 'lucide-react';
 import DataTable from '@/components/DataTable';
 import StatusBadge from '@/components/StatusBadge';
@@ -198,6 +199,9 @@ export default function QuoteChecker() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // CPQ package detection
+  const [cpqNotDetected, setCpqNotDetected] = useState(false);
+
   // Sections collapse state
   const [expandedSections, setExpandedSections] = useState<Record<string, boolean>>({
     A: true,
@@ -215,6 +219,7 @@ export default function QuoteChecker() {
     setLookupLoading(true);
     setLookupError(null);
     setLookupResults([]);
+    setCpqNotDetected(false);
 
     try {
       const sanitized = input.replace(/'/g, "\\'");
@@ -226,7 +231,19 @@ export default function QuoteChecker() {
         setLookupError('No quotes found matching the search criteria.');
       }
     } catch (err) {
-      setLookupError(err instanceof Error ? err.message : 'Lookup failed');
+      const message = err instanceof Error ? err.message : 'Lookup failed';
+      // Detect if the SBQQ objects simply don't exist in this org
+      if (
+        message.toLowerCase().includes('sbqq') ||
+        message.toLowerCase().includes('no such column') ||
+        message.toLowerCase().includes("doesn't exist") ||
+        message.toLowerCase().includes('invalid entity') ||
+        message.toLowerCase().includes('sObject type')
+      ) {
+        setCpqNotDetected(true);
+      } else {
+        setLookupError(message);
+      }
     } finally {
       setLookupLoading(false);
     }
@@ -285,7 +302,18 @@ export default function QuoteChecker() {
         const linesResult = await query<QuoteLineRecord>(linesSoql);
         setQuoteLines(linesResult.records);
       } catch (err) {
-        setError(err instanceof Error ? err.message : 'Failed to load quote');
+        const message = err instanceof Error ? err.message : 'Failed to load quote';
+        if (
+          message.toLowerCase().includes('sbqq') ||
+          message.toLowerCase().includes('no such column') ||
+          message.toLowerCase().includes("doesn't exist") ||
+          message.toLowerCase().includes('invalid entity') ||
+          message.toLowerCase().includes('sObject type')
+        ) {
+          setCpqNotDetected(true);
+        } else {
+          setError(message);
+        }
       } finally {
         setLoading(false);
       }
@@ -752,6 +780,18 @@ export default function QuoteChecker() {
           </div>
         )}
       </div>
+
+      {/* CPQ Not Detected */}
+      {cpqNotDetected && (
+        <div className="flex justify-center py-12">
+          <div className="flex flex-col items-center gap-3 max-w-md p-6 rounded-xl border border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-900/20">
+            <Info className="w-8 h-8 text-blue-500" />
+            <p className="text-sm text-blue-800 dark:text-blue-300 text-center">
+              Salesforce CPQ (SBQQ) package not detected in this org. The Quote Checker requires CPQ to be installed.
+            </p>
+          </div>
+        </div>
+      )}
 
       {/* Loading State */}
       {loading && <LoadingSpinner message="Loading quote data and running completeness checks..." />}

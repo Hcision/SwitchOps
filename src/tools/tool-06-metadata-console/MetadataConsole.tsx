@@ -258,21 +258,45 @@ export default function MetadataConsole() {
     setTypesLoading(true);
     setTypesError(null);
     try {
-      const result = await queryAll<{
-        Id?: string;
-        QualifiedApiName: string;
-        Label: string;
-        DeveloperName: string;
-      }>(
-        "SELECT QualifiedApiName, Label, DeveloperName FROM EntityDefinition WHERE QualifiedApiName LIKE '%__mdt' ORDER BY Label ASC",
-      );
+      let types: MetadataTypeInfo[] = [];
 
-      const types: MetadataTypeInfo[] = result.records.map((r) => ({
-        qualifiedApiName: r.QualifiedApiName,
-        label: r.Label,
-        developerName: r.DeveloperName,
-        recordCount: null,
-      }));
+      try {
+        // Primary approach: query EntityDefinition with LIKE filter for __mdt types
+        const result = await queryAll<{
+          Id?: string;
+          QualifiedApiName: string;
+          Label: string;
+          DeveloperName?: string;
+        }>(
+          "SELECT QualifiedApiName, Label FROM EntityDefinition WHERE QualifiedApiName LIKE '%__mdt' ORDER BY Label ASC",
+        );
+
+        types = result.records.map((r) => ({
+          qualifiedApiName: r.QualifiedApiName,
+          label: r.Label,
+          developerName: r.QualifiedApiName.replace(/__mdt$/, ''),
+          recordCount: null,
+        }));
+      } catch {
+        // Fallback: query all customizable entities and filter client-side
+        const result = await queryAll<{
+          Id?: string;
+          DurableId?: string;
+          QualifiedApiName: string;
+          Label: string;
+        }>(
+          'SELECT DurableId, QualifiedApiName, Label FROM EntityDefinition WHERE IsCustomizable = true ORDER BY Label ASC',
+        );
+
+        types = result.records
+          .filter((r) => r.QualifiedApiName.endsWith('__mdt'))
+          .map((r) => ({
+            qualifiedApiName: r.QualifiedApiName,
+            label: r.Label,
+            developerName: r.QualifiedApiName.replace(/__mdt$/, ''),
+            recordCount: null,
+          }));
+      }
 
       setMetadataTypes(types);
     } catch (err) {
@@ -300,7 +324,15 @@ export default function MetadataConsole() {
 
     try {
       // 1. Describe the object to discover fields
-      const describeResult = await describe(typeName);
+      let describeResult;
+      try {
+        describeResult = await describe(typeName);
+      } catch (descErr) {
+        const msg = descErr instanceof Error ? descErr.message : String(descErr);
+        setRecordsError(`Unable to describe metadata type "${typeName}": ${msg}`);
+        setRecordsLoading(false);
+        return;
+      }
 
       const mdtFields: MetadataField[] = describeResult.fields.map((f) => ({
         name: f.name,
@@ -318,16 +350,31 @@ export default function MetadataConsole() {
       setFields(mdtFields);
 
       // 2. Build field list and query all records
-      const fieldList = buildFieldList(mdtFields);
-      const soql = `SELECT ${fieldList.join(', ')} FROM ${typeName} ORDER BY DeveloperName ASC`;
-      const result = await queryAll<MetadataRecord>(soql);
+      let queryRecords: MetadataRecord[] = [];
+      try {
+        const fieldList = buildFieldList(mdtFields);
+        const soql = `SELECT ${fieldList.join(', ')} FROM ${typeName} ORDER BY DeveloperName ASC`;
+        const result = await queryAll<MetadataRecord>(soql);
+        queryRecords = result.records;
+      } catch (queryErr) {
+        const msg = queryErr instanceof Error ? queryErr.message : String(queryErr);
+        setRecordsError(`Unable to query records for "${typeName}": ${msg}. The type may have no accessible records or the query may be restricted.`);
+        setRecords([]);
+        setMetadataTypes((prev) =>
+          prev.map((t) =>
+            t.qualifiedApiName === typeName ? { ...t, recordCount: 0 } : t,
+          ),
+        );
+        setRecordsLoading(false);
+        return;
+      }
 
-      setRecords(result.records);
+      setRecords(queryRecords);
 
       // Update record count in the type list
       setMetadataTypes((prev) =>
         prev.map((t) =>
-          t.qualifiedApiName === typeName ? { ...t, recordCount: result.records.length } : t,
+          t.qualifiedApiName === typeName ? { ...t, recordCount: queryRecords.length } : t,
         ),
       );
     } catch (err) {

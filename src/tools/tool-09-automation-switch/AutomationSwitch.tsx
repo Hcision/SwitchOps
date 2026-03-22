@@ -37,7 +37,6 @@ interface FlowRecord {
   DefinitionId: string;
   FullName: string;
   ProcessType: string;
-  TriggerType: string;
   Status: string;
   [key: string]: unknown;
 }
@@ -145,6 +144,33 @@ function categorizeFlow(fullName: string): FlowCategory {
   return 'Other';
 }
 
+/** Common Salesforce objects used for trigger type inference. */
+const TRIGGER_HINT_OBJECTS = [
+  'Account', 'Contact', 'Opportunity', 'Lead', 'Case', 'Task',
+  'Event', 'Order', 'Product2', 'Campaign', 'Contract', 'Quote',
+  'User', 'WorkOrder', 'ServiceAppointment', 'Asset',
+];
+
+/**
+ * Derive a trigger type string from ProcessType and FullName.
+ * Since TriggerType is not available on the Flow Tooling API entity,
+ * we infer it from naming conventions and ProcessType.
+ */
+function deriveTriggerType(processType: string, fullName: string): string {
+  if (processType === 'RecordTriggeredFlow') return 'RecordAfterSave';
+  if (processType === 'AutoLaunchedFlow') {
+    const name = fullName.replace(/-\d+$/, '');
+    for (const obj of TRIGGER_HINT_OBJECTS) {
+      if (name.startsWith(obj) || name.includes(`_${obj}_`) || name.includes(`${obj}_`)) {
+        return 'RecordAfterSave';
+      }
+    }
+  }
+  if (processType === 'Scheduled') return 'Scheduled';
+  if (processType === 'PlatformEvent' || processType === 'CustomEvent') return 'PlatformEvent';
+  return '';
+}
+
 function formatDuration(ms: number): string {
   const totalSeconds = Math.floor(ms / 1000);
   const hours = Math.floor(totalSeconds / 3600);
@@ -177,6 +203,7 @@ export default function AutomationSwitch() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [errorDetails, setErrorDetails] = useState<string | undefined>();
+  const [switchWarning, setSwitchWarning] = useState<string | null>(null);
   const [automationSwitch, setAutomationSwitch] = useState<AutomationSwitchRecord | null>(null);
   const [flows, setFlows] = useState<FlowRow[]>([]);
   const [entrySnapshot, setEntrySnapshot] = useState<FlowRow[]>([]);
@@ -268,17 +295,23 @@ export default function AutomationSwitch() {
     setErrorDetails(undefined);
 
     try {
-      // Fetch automation switch custom setting
-      const switchResult = await queryAll<AutomationSwitchRecord>(
-        'SELECT Disable_Flows__c, Disable_Triggers__c FROM Automation_Switch__c LIMIT 1',
-      );
-      if (switchResult.records.length > 0) {
-        setAutomationSwitch(switchResult.records[0]);
+      // Fetch automation switch custom setting (may not exist in this org)
+      setSwitchWarning(null);
+      try {
+        const switchResult = await queryAll<AutomationSwitchRecord>(
+          'SELECT Disable_Flows__c, Disable_Triggers__c FROM Automation_Switch__c LIMIT 1',
+        );
+        if (switchResult.records.length > 0) {
+          setAutomationSwitch(switchResult.records[0]);
+        }
+      } catch {
+        setSwitchWarning('Automation_Switch__c custom setting not found in this org');
+        setAutomationSwitch(null);
       }
 
       // Fetch all active flows via Tooling API
       const flowResult = await toolingQuery<FlowRecord>(
-        "SELECT Id, DefinitionId, FullName, ProcessType, TriggerType, Status FROM Flow WHERE Status = 'Active'",
+        "SELECT Id, DefinitionId, FullName, ProcessType, Status FROM Flow WHERE Status = 'Active'",
       );
 
       const flowRows: FlowRow[] = flowResult.records.map((rec) => ({
@@ -286,7 +319,7 @@ export default function AutomationSwitch() {
         definitionId: rec.DefinitionId,
         fullName: rec.FullName,
         processType: rec.ProcessType,
-        triggerType: rec.TriggerType ?? '',
+        triggerType: deriveTriggerType(rec.ProcessType, rec.FullName),
         status: rec.Status,
         category: categorizeFlow(rec.FullName),
         enabled: true,
@@ -672,6 +705,14 @@ export default function AutomationSwitch() {
           details={errorDetails}
           onRetry={fetchData}
         />
+      )}
+
+      {/* ── Custom Setting Warning ──────────────────────────────────────── */}
+      {switchWarning && (
+        <div className="flex items-center gap-2 rounded-lg border border-amber-300 dark:border-amber-600 bg-amber-50 dark:bg-amber-900/20 px-4 py-3 text-sm text-amber-800 dark:text-amber-200">
+          <AlertTriangle className="w-4 h-4 shrink-0" />
+          {switchWarning}
+        </div>
       )}
 
       {/* ── Current State Banner ──────────────────────────────────────────── */}

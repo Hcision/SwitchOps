@@ -439,6 +439,9 @@ export default function SapMonitor() {
   const [errorLogs, setErrorLogs] = useState<ErrorLog[]>([]);
   const [vcLogs, setVcLogs] = useState<VcLog[]>([]);
 
+  // Missing objects warning
+  const [missingObjects, setMissingObjects] = useState<string[]>([]);
+
   // Drill-down
   const [drillDownFilter, setDrillDownFilter] = useState<string | null>(null);
 
@@ -450,42 +453,58 @@ export default function SapMonitor() {
   // ── Data Fetching ────────────────────────────────────────────────────────
 
   const fetchData = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+
+    const since = soqlDateTimeAgo(PERIOD_HOURS[period]);
+    const notFound: string[] = [];
+
+    // Query each data source independently so one failure doesn't crash the others
+    let sapRecords: SapTransactLog[] = [];
     try {
-      setLoading(true);
-      setError(null);
-
-      const since = soqlDateTimeAgo(PERIOD_HOURS[period]);
-
-      const [sapResult, errorResult, vcResult] = await Promise.all([
-        queryAll<SapTransactLog>(
-          `SELECT Id, Account__c, CPQQuote__c, Message__c, MessageType__c, InvokeType__c, CreatedDate ` +
-            `FROM ensxtx_SAP_Transact_Log__c ` +
-            `WHERE CreatedDate >= ${since} ` +
-            `ORDER BY CreatedDate DESC`,
-        ),
-        queryAll<ErrorLog>(
-          `SELECT Id, Error_Code__c, Error_Message__c, Work_Order__c, Related_Object_Name__c, CreatedDate ` +
-            `FROM Error_Log__c ` +
-            `WHERE CreatedDate >= ${since} ` +
-            `ORDER BY CreatedDate DESC`,
-        ),
-        queryAll<VcLog>(
-          `SELECT Id, RequestJSON__c, ResponseJSON__c, Product__c, CreatedDate ` +
-            `FROM ensxtx_VC_Log__c ` +
-            `WHERE CreatedDate >= ${since} ` +
-            `ORDER BY CreatedDate DESC`,
-        ),
-      ]);
-
-      setSapLogs(sapResult.records);
-      setErrorLogs(errorResult.records);
-      setVcLogs(vcResult.records);
-      setLastFetchedAt(new Date());
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to fetch SAP integration data');
-    } finally {
-      setLoading(false);
+      const sapResult = await queryAll<SapTransactLog>(
+        `SELECT Id, Account__c, CPQQuote__c, Message__c, MessageType__c, InvokeType__c, CreatedDate ` +
+          `FROM ensxtx_SAP_Transact_Log__c ` +
+          `WHERE CreatedDate >= ${since} ` +
+          `ORDER BY CreatedDate DESC`,
+      );
+      sapRecords = sapResult.records;
+    } catch {
+      notFound.push('ensxtx_SAP_Transact_Log__c');
     }
+
+    let errorRecords: ErrorLog[] = [];
+    try {
+      const errorResult = await queryAll<ErrorLog>(
+        `SELECT Id, Error_Code__c, Error_Message__c, Work_Order__c, Related_Object_Name__c, CreatedDate ` +
+          `FROM Error_Log__c ` +
+          `WHERE CreatedDate >= ${since} ` +
+          `ORDER BY CreatedDate DESC`,
+      );
+      errorRecords = errorResult.records;
+    } catch {
+      notFound.push('Error_Log__c');
+    }
+
+    let vcRecords: VcLog[] = [];
+    try {
+      const vcResult = await queryAll<VcLog>(
+        `SELECT Id, RequestJSON__c, ResponseJSON__c, Product__c, CreatedDate ` +
+          `FROM ensxtx_VC_Log__c ` +
+          `WHERE CreatedDate >= ${since} ` +
+          `ORDER BY CreatedDate DESC`,
+      );
+      vcRecords = vcResult.records;
+    } catch {
+      notFound.push('ensxtx_VC_Log__c');
+    }
+
+    setSapLogs(sapRecords);
+    setErrorLogs(errorRecords);
+    setVcLogs(vcRecords);
+    setMissingObjects(notFound);
+    setLastFetchedAt(new Date());
+    setLoading(false);
   }, [period]);
 
   // Initial fetch and re-fetch on period change
@@ -711,6 +730,18 @@ export default function SapMonitor() {
           message={error}
           onRetry={fetchData}
         />
+      )}
+
+      {/* ── Missing Objects Warning ────────────────────────────────────── */}
+      {missingObjects.length > 0 && (
+        <div className="flex items-start gap-3 p-4 rounded-xl border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-900/20">
+          <AlertTriangle className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" />
+          <p className="text-sm text-amber-800 dark:text-amber-300">
+            Some integration objects were not found in this org:{' '}
+            <span className="font-semibold">{missingObjects.join(', ')}</span>.
+            The SAP Monitor requires these custom objects to be installed.
+          </p>
+        </div>
       )}
 
       {/* ── Time Period Tabs + Auto-Refresh ─────────────────────────────── */}

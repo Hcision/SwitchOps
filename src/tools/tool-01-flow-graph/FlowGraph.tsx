@@ -33,7 +33,6 @@ interface FlowRecord {
   DefinitionId: string;
   FullName: string;
   ProcessType: string;
-  TriggerType: string | null;
   Status: string;
   Description: string | null;
 }
@@ -118,10 +117,32 @@ function deriveLabel(fullName: string): string {
 }
 
 /**
+ * Derive a trigger type string from ProcessType and FullName.
+ * Since TriggerType is not available on the Flow Tooling API entity,
+ * we infer it from naming conventions and ProcessType.
+ */
+function deriveTriggerType(processType: string, fullName: string): string | null {
+  if (processType === 'RecordTriggeredFlow') return 'RecordAfterSave';
+  // AutoLaunchedFlow with object-like naming hints at record-triggered
+  if (processType === 'AutoLaunchedFlow') {
+    const name = fullName.replace(/-\d+$/, '');
+    for (const obj of COMMON_OBJECTS) {
+      if (name.startsWith(obj) || name.includes(`_${obj}_`) || name.includes(`${obj}_`)) {
+        return 'RecordAfterSave';
+      }
+    }
+  }
+  if (processType === 'Scheduled') return 'Scheduled';
+  if (processType === 'PlatformEvent' || processType === 'CustomEvent') return 'PlatformEvent';
+  return null;
+}
+
+/**
  * Determine the effective process type for coloring.
- * Record-triggered flows are AutoLaunchedFlow with a triggerType.
+ * Record-triggered flows are identified via ProcessType or naming convention.
  */
 function effectiveType(processType: string, triggerType: string | null): string {
+  if (processType === 'RecordTriggeredFlow') return 'RecordTriggered';
   if (processType === 'AutoLaunchedFlow' && triggerType) {
     return 'RecordTriggered';
   }
@@ -134,6 +155,7 @@ function effectiveType(processType: string, triggerType: string | null): string 
  */
 function inferTriggerObject(fullName: string, triggerType: string | null): string | null {
   if (!triggerType) return null;
+  // triggerType is derived, so proceed with name matching
   const name = fullName.replace(/-\d+$/, '');
   for (const obj of COMMON_OBJECTS) {
     if (name.startsWith(obj) || name.includes(`_${obj}_`) || name.includes(`${obj}_`)) {
@@ -161,8 +183,9 @@ function buildDependencyModel(
 
   return flows.map((flow, idx) => {
     const seed = hashCode(flow.Id);
-    const triggerObject = inferTriggerObject(flow.FullName, flow.TriggerType);
-    const eType = effectiveType(flow.ProcessType, flow.TriggerType);
+    const derivedTrigger = deriveTriggerType(flow.ProcessType, flow.FullName);
+    const triggerObject = inferTriggerObject(flow.FullName, derivedTrigger);
+    const eType = effectiveType(flow.ProcessType, derivedTrigger);
 
     // Simulate element count based on process type
     const baseElements = eType === 'Screen' ? 8 : eType === 'RecordTriggered' ? 12 : 6;
@@ -219,7 +242,7 @@ function buildDependencyModel(
       fullName: flow.FullName,
       label: deriveLabel(flow.FullName),
       processType: flow.ProcessType,
-      triggerType: flow.TriggerType,
+      triggerType: derivedTrigger,
       triggerObject,
       status: flow.Status,
       description: flow.Description,
@@ -702,7 +725,7 @@ export default function FlowGraph() {
     try {
       // Fetch active flows via Tooling API
       const flowResult = await toolingQuery<FlowRecord>(
-        "SELECT Id, DefinitionId, FullName, ProcessType, TriggerType, Status, Description FROM Flow WHERE Status = 'Active'",
+        "SELECT Id, DefinitionId, FullName, ProcessType, Status, Description FROM Flow WHERE Status = 'Active'",
       );
 
       // Fetch Apex classes for dependency references

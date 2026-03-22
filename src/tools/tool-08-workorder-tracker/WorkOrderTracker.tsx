@@ -349,6 +349,9 @@ export default function WorkOrderTracker() {
   const [caseRecord, setCaseRecord] = useState<CaseRecord | null>(null);
   const [assetRecord, setAssetRecord] = useState<AssetRecord | null>(null);
 
+  // ── SAP fields availability ─────────────────────────────────────────────
+  const [sapFieldsAvailable, setSapFieldsAvailable] = useState(true);
+
   // ── UI state ──────────────────────────────────────────────────────────────
   const [swimlaneSections, setSwimlaneSections] = useState<SwimlaneSection[]>(SWIMLANE_ROWS);
   const [showDatePropagation, setShowDatePropagation] = useState(false);
@@ -379,18 +382,47 @@ export default function WorkOrderTracker() {
       setAssetRecord(null);
       setBottlenecks([]);
 
-      const soql =
-        `SELECT Id, WorkOrderNumber, Status, Subject, CaseId, AssetId, StartDate, EndDate, ` +
-        `SAP_DTR_Order_Reference__c, DTR_Order_SAP_Synchronisation_Status__c ` +
+      // First query with only standard fields
+      const standardSoql =
+        `SELECT Id, WorkOrderNumber, Status, Subject, CaseId, AssetId, StartDate, EndDate ` +
         `FROM WorkOrder ` +
         `WHERE WorkOrderNumber = '${trimmed}' ` +
         `OR CaseId IN (SELECT Id FROM Case WHERE CaseNumber = '${trimmed}')`;
 
-      const result = await query<WorkOrderRecord>(soql);
-      setWorkOrders(result.records);
+      const result = await query<WorkOrderRecord>(standardSoql);
+      const records = result.records;
 
-      if (result.records.length === 1) {
-        await loadRelatedData(result.records[0]);
+      // Attempt to enrich with SAP-specific fields
+      let hasSapFields = true;
+      if (records.length > 0) {
+        const woIds = records.map((r) => `'${r.Id}'`).join(',');
+        try {
+          const sapResult = await query<{ Id: string; SAP_DTR_Order_Reference__c: string | null; DTR_Order_SAP_Synchronisation_Status__c: string | null }>(
+            `SELECT Id, SAP_DTR_Order_Reference__c, DTR_Order_SAP_Synchronisation_Status__c ` +
+            `FROM WorkOrder WHERE Id IN (${woIds})`,
+          );
+          const sapMap = new Map(sapResult.records.map((r) => [r.Id, r]));
+          records.forEach((wo) => {
+            const sapData = sapMap.get(wo.Id);
+            if (sapData) {
+              wo.SAP_DTR_Order_Reference__c = sapData.SAP_DTR_Order_Reference__c;
+              wo.DTR_Order_SAP_Synchronisation_Status__c = sapData.DTR_Order_SAP_Synchronisation_Status__c;
+            }
+          });
+        } catch {
+          hasSapFields = false;
+          records.forEach((wo) => {
+            wo.SAP_DTR_Order_Reference__c = null;
+            wo.DTR_Order_SAP_Synchronisation_Status__c = null;
+          });
+        }
+      }
+
+      setSapFieldsAvailable(hasSapFields);
+      setWorkOrders(records);
+
+      if (records.length === 1) {
+        await loadRelatedData(records[0]);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to search work orders');
@@ -415,23 +447,51 @@ export default function WorkOrderTracker() {
       setAssetRecord(null);
       setBottlenecks([]);
 
-      let soql: string;
+      // Query with standard fields only first
+      let standardSoql: string;
       if (batchFilterField === 'Status') {
-        soql =
-          `SELECT Id, WorkOrderNumber, Status, Subject, CaseId, AssetId, StartDate, EndDate, ` +
-          `SAP_DTR_Order_Reference__c, DTR_Order_SAP_Synchronisation_Status__c ` +
+        standardSoql =
+          `SELECT Id, WorkOrderNumber, Status, Subject, CaseId, AssetId, StartDate, EndDate ` +
           `FROM WorkOrder WHERE Status = '${trimmed}' ORDER BY CreatedDate DESC LIMIT 200`;
       } else {
-        soql =
-          `SELECT Id, WorkOrderNumber, Status, Subject, CaseId, AssetId, StartDate, EndDate, ` +
-          `SAP_DTR_Order_Reference__c, DTR_Order_SAP_Synchronisation_Status__c ` +
+        standardSoql =
+          `SELECT Id, WorkOrderNumber, Status, Subject, CaseId, AssetId, StartDate, EndDate ` +
           `FROM WorkOrder WHERE ServiceTerritoryId IN ` +
           `(SELECT Id FROM ServiceTerritory WHERE Name LIKE '%${trimmed}%') ` +
           `ORDER BY CreatedDate DESC LIMIT 200`;
       }
 
-      const result = await queryAll<WorkOrderRecord>(soql);
-      setWorkOrders(result.records);
+      const result = await queryAll<WorkOrderRecord>(standardSoql);
+      const records = result.records;
+
+      // Attempt to enrich with SAP-specific fields
+      let hasSapFields = true;
+      if (records.length > 0) {
+        const woIds = records.map((r) => `'${r.Id}'`).join(',');
+        try {
+          const sapResult = await queryAll<{ Id: string; SAP_DTR_Order_Reference__c: string | null; DTR_Order_SAP_Synchronisation_Status__c: string | null }>(
+            `SELECT Id, SAP_DTR_Order_Reference__c, DTR_Order_SAP_Synchronisation_Status__c ` +
+            `FROM WorkOrder WHERE Id IN (${woIds})`,
+          );
+          const sapMap = new Map(sapResult.records.map((r) => [r.Id, r]));
+          records.forEach((wo) => {
+            const sapData = sapMap.get(wo.Id);
+            if (sapData) {
+              wo.SAP_DTR_Order_Reference__c = sapData.SAP_DTR_Order_Reference__c;
+              wo.DTR_Order_SAP_Synchronisation_Status__c = sapData.DTR_Order_SAP_Synchronisation_Status__c;
+            }
+          });
+        } catch {
+          hasSapFields = false;
+          records.forEach((wo) => {
+            wo.SAP_DTR_Order_Reference__c = null;
+            wo.DTR_Order_SAP_Synchronisation_Status__c = null;
+          });
+        }
+      }
+
+      setSapFieldsAvailable(hasSapFields);
+      setWorkOrders(records);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load work orders');
     } finally {
@@ -547,16 +607,18 @@ export default function WorkOrderTracker() {
           }
         });
 
-        // DTR sync failures
-        const syncStatus = wo.DTR_Order_SAP_Synchronisation_Status__c?.toLowerCase() ?? '';
-        if (syncStatus.includes('error') || syncStatus.includes('fail')) {
-          detected.push({
-            type: 'sync-failure',
-            severity: 'danger',
-            entity: `WO ${wo.WorkOrderNumber}`,
-            message: `SAP DTR sync failed: ${wo.DTR_Order_SAP_Synchronisation_Status__c}`,
-            recordId: wo.Id,
-          });
+        // DTR sync failures (only check if SAP fields are available)
+        if (sapFieldsAvailable) {
+          const syncStatus = wo.DTR_Order_SAP_Synchronisation_Status__c?.toLowerCase() ?? '';
+          if (syncStatus.includes('error') || syncStatus.includes('fail')) {
+            detected.push({
+              type: 'sync-failure',
+              severity: 'danger',
+              entity: `WO ${wo.WorkOrderNumber}`,
+              message: `SAP DTR sync failed: ${wo.DTR_Order_SAP_Synchronisation_Status__c}`,
+              recordId: wo.Id,
+            });
+          }
         }
 
         setBottlenecks(detected);
@@ -566,7 +628,7 @@ export default function WorkOrderTracker() {
         setLoading(false);
       }
     },
-    [],
+    [sapFieldsAvailable],
   );
 
   // ── Date Propagation entries ──────────────────────────────────────────────
@@ -1011,7 +1073,7 @@ export default function WorkOrderTracker() {
           </div>
           <DataTable
             data={workOrders}
-            columns={batchColumns}
+            columns={sapFieldsAvailable ? batchColumns : batchColumns.filter((c) => !('accessorKey' in c && c.accessorKey === 'DTR_Order_SAP_Synchronisation_Status__c'))}
             searchable
             exportable
             exportFilename="work-orders-batch"
@@ -1040,7 +1102,7 @@ export default function WorkOrderTracker() {
           </div>
 
           <div className="divide-y divide-surface-100 dark:divide-surface-800">
-            {swimlaneSections.map((section) => (
+            {swimlaneSections.filter((s) => s.key !== 'sapsync' || sapFieldsAvailable).map((section) => (
               <div key={section.key}>
                 {/* Section header */}
                 <button

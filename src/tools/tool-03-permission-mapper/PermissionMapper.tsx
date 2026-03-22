@@ -259,7 +259,19 @@ export default function PermissionMapper() {
         queryAll<UserRecord & { Id: string }>(SOQL_ACTIVE_USERS),
       ]);
 
-      const psList = psResult.records;
+      let psList = psResult.records;
+
+      // Fallback: if IsCustom filter returns nothing, try without it
+      if (psList.length === 0) {
+        const fallbackResult = await queryAll<PermissionSetRecord & { Id: string }>(
+          'SELECT Id, Name, Label FROM PermissionSet WHERE IsOwnedByProfile = false LIMIT 100',
+        );
+        psList = fallbackResult.records.map((r) => ({
+          ...r,
+          Description: r.Description ?? null,
+        }));
+      }
+
       const assignList = assignResult.records;
       const userList = userResult.records;
 
@@ -368,57 +380,116 @@ export default function PermissionMapper() {
   );
 
   // ── Compare handler ───────────────────────────────────────────────────
-  const handleCompare = useCallback(() => {
+  const handleCompare = useCallback(async () => {
     if (!compareLeft || !compareRight) return;
 
-    let leftPerms: Map<string, MatrixCell>;
-    let rightPerms: Map<string, MatrixCell>;
-    let leftLabel: string;
-    let rightLabel: string;
+    setLoading(true);
+    setError(null);
 
-    if (compareMode === 'permsets') {
-      leftPerms = new Map(
-        (psPerms.get(compareLeft) ?? []).map((c) => [c.objectName, c]),
-      );
-      rightPerms = new Map(
-        (psPerms.get(compareRight) ?? []).map((c) => [c.objectName, c]),
-      );
-      const leftPs = permissionSets.find((ps) => ps.Id === compareLeft);
-      const rightPs = permissionSets.find((ps) => ps.Id === compareRight);
-      leftLabel = leftPs?.Label ?? compareLeft;
-      rightLabel = rightPs?.Label ?? compareRight;
-    } else {
-      // Compare users: build effective perms for each
-      leftPerms = new Map<string, MatrixCell>();
-      rightPerms = new Map<string, MatrixCell>();
+    try {
+      let leftPerms: Map<string, MatrixCell>;
+      let rightPerms: Map<string, MatrixCell>;
+      let leftLabel: string;
+      let rightLabel: string;
 
-      for (const a of assignments.filter((a) => a.AssigneeId === compareLeft)) {
-        for (const cell of psPerms.get(a.PermissionSetId) ?? []) {
-          leftPerms.set(cell.objectName, mergePerms(leftPerms.get(cell.objectName), cell));
+      // Helper: ensure ObjectPermissions are loaded for a given permission set ID
+      const ensurePermsLoaded = async (psId: string): Promise<MatrixCell[]> => {
+        const existing = psPerms.get(psId);
+        if (existing) return existing;
+
+        // Fetch ObjectPermissions for this PS on demand
+        try {
+          const result = await queryAll<ObjectPermissionRecord & { Id?: string }>(
+            SOQL_OBJECT_PERMISSIONS(psId),
+          );
+          const cells: MatrixCell[] = result.records.map((r) => {
+            const partial = {
+              objectName: r.SobjectType,
+              read: r.PermissionsRead,
+              create: r.PermissionsCreate,
+              edit: r.PermissionsEdit,
+              delete: r.PermissionsDelete,
+            };
+            return { ...partial, level: deriveLevel(partial) };
+          });
+          // Update the shared map so subsequent lookups find it
+          setPsPerms((prev) => {
+            const next = new Map(prev);
+            next.set(psId, cells);
+            return next;
+          });
+          return cells;
+        } catch {
+          return [];
         }
-      }
-      for (const a of assignments.filter((a) => a.AssigneeId === compareRight)) {
-        for (const cell of psPerms.get(a.PermissionSetId) ?? []) {
-          rightPerms.set(cell.objectName, mergePerms(rightPerms.get(cell.objectName), cell));
+      };
+
+      if (compareMode === 'permsets') {
+        const [leftCells, rightCells] = await Promise.all([
+          ensurePermsLoaded(compareLeft),
+          ensurePermsLoaded(compareRight),
+        ]);
+        leftPerms = new Map(leftCells.map((c) => [c.objectName, c]));
+        rightPerms = new Map(rightCells.map((c) => [c.objectName, c]));
+        const leftPs = permissionSets.find((ps) => ps.Id === compareLeft);
+        const rightPs = permissionSets.find((ps) => ps.Id === compareRight);
+        leftLabel = leftPs?.Label ?? compareLeft;
+        rightLabel = rightPs?.Label ?? compareRight;
+      } else {
+        // Compare users: build effective perms for each
+        leftPerms = new Map<string, MatrixCell>();
+        rightPerms = new Map<string, MatrixCell>();
+
+        const leftAssignments = assignments.filter((a) => a.AssigneeId === compareLeft);
+        const rightAssignments = assignments.filter((a) => a.AssigneeId === compareRight);
+
+        // Fetch all missing permission data in parallel
+        const allPsIds = new Set([
+          ...leftAssignments.map((a) => a.PermissionSetId),
+          ...rightAssignments.map((a) => a.PermissionSetId),
+        ]);
+        const fetchPromises = Array.from(allPsIds).map((psId) => ensurePermsLoaded(psId));
+        const fetchedResults = await Promise.all(fetchPromises);
+
+        // Build a local lookup from the fetched results
+        const localPermsMap = new Map<string, MatrixCell[]>();
+        const psIdArray = Array.from(allPsIds);
+        psIdArray.forEach((psId, idx) => {
+          localPermsMap.set(psId, fetchedResults[idx]);
+        });
+
+        for (const a of leftAssignments) {
+          for (const cell of localPermsMap.get(a.PermissionSetId) ?? []) {
+            leftPerms.set(cell.objectName, mergePerms(leftPerms.get(cell.objectName), cell));
+          }
         }
+        for (const a of rightAssignments) {
+          for (const cell of localPermsMap.get(a.PermissionSetId) ?? []) {
+            rightPerms.set(cell.objectName, mergePerms(rightPerms.get(cell.objectName), cell));
+          }
+        }
+
+        const leftUser = users.find((u) => u.Id === compareLeft);
+        const rightUser = users.find((u) => u.Id === compareRight);
+        leftLabel = leftUser?.Name ?? compareLeft;
+        rightLabel = rightUser?.Name ?? compareRight;
       }
 
-      const leftUser = users.find((u) => u.Id === compareLeft);
-      const rightUser = users.find((u) => u.Id === compareRight);
-      leftLabel = leftUser?.Name ?? compareLeft;
-      rightLabel = rightUser?.Name ?? compareRight;
+      const allObjs = new Set([...leftPerms.keys(), ...rightPerms.keys()]);
+      const rows = Array.from(allObjs)
+        .sort()
+        .map((obj) => {
+          const ll = leftPerms.get(obj)?.level ?? 'none';
+          const rl = rightPerms.get(obj)?.level ?? 'none';
+          return { objectName: obj, leftLevel: ll, rightLevel: rl, isDiff: ll !== rl };
+        });
+
+      setCompareResult({ leftLabel, rightLabel, rows });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to compare permissions');
+    } finally {
+      setLoading(false);
     }
-
-    const allObjs = new Set([...leftPerms.keys(), ...rightPerms.keys()]);
-    const rows = Array.from(allObjs)
-      .sort()
-      .map((obj) => {
-        const ll = leftPerms.get(obj)?.level ?? 'none';
-        const rl = rightPerms.get(obj)?.level ?? 'none';
-        return { objectName: obj, leftLevel: ll, rightLevel: rl, isDiff: ll !== rl };
-      });
-
-    setCompareResult({ leftLabel, rightLabel, rows });
   }, [compareLeft, compareRight, compareMode, psPerms, permissionSets, assignments, users]);
 
   // ── Export handlers ───────────────────────────────────────────────────
